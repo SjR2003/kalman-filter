@@ -1,0 +1,254 @@
+#pragma once
+
+#include <queue>
+#include <cmath>
+#include "display.h"
+#include "utils/utils.h"
+
+struct VehicleState
+{
+    double x, y, psi, v;
+    double yaw_rate, steering;
+    VehicleState() : x(0.0), y(0.0), psi(0.0), v(0.0), yaw_rate(0.0), steering(0.0) {}
+    VehicleState(double setX, double setY, double setPsi, double setV) : x(setX), y(setY), psi(setPsi), v(setV), yaw_rate(0.0), steering(0.0) {}
+    VehicleState(double setX, double setY, double setPsi, double setV, double setPsiDot, double setSteering) : x(setX), y(setY), psi(setPsi), v(setV), yaw_rate(setPsiDot), steering(setSteering) {}
+};
+
+class MotionCommandBase
+{
+public:
+    MotionCommandBase() : m_velocity_command(0.0), m_steering_command(0.0) {}
+    virtual void start_command(double time, VehicleState state)
+    {
+        m_start_time = time;
+        m_start_state = state;
+    }
+    virtual void end_command(double time, double dt, VehicleState state) {}
+    virtual bool update(double time, double dt, VehicleState state) { return false; }
+    virtual double get_velocity_command() { return m_velocity_command; }
+    virtual double get_steering_command() { return m_steering_command; }
+
+protected:
+    double m_velocity_command, m_steering_command, m_start_time;
+    VehicleState m_start_state;
+};
+
+class MotionCommandStraight : public MotionCommandBase
+{
+public:
+    MotionCommandStraight(double command_time, double command_velocity) : m_command_time(command_time), m_command_velocity(command_velocity) {}
+    bool update(double time, double dt, VehicleState state)
+    {
+        m_velocity_command = m_command_velocity;
+        m_steering_command = 0.0;
+        return time > (m_start_time + m_command_time);
+    }
+
+private:
+    double m_command_time, m_command_velocity;
+};
+
+class MotionCommandTurnTo : public MotionCommandBase
+{
+public:
+    MotionCommandTurnTo(double command_heading, double command_velocity) : m_command_heading(command_heading), m_command_velocity(command_velocity) {}
+    bool update(double time, double dt, VehicleState state)
+    {
+        m_velocity_command = m_command_velocity;
+        double angle_error = wrap_angle(m_command_heading - state.psi);
+        m_steering_command = angle_error * (std::signbit(state.v) ? -1.0 : 1.0);
+        return std::fabs(angle_error) < 0.001;
+    }
+
+private:
+    double m_command_heading, m_command_velocity;
+};
+
+class MotionCommandMoveTo : public MotionCommandBase
+{
+public:
+    MotionCommandMoveTo(double command_x, double command_y, double command_velocity) : m_command_x(command_x), m_command_y(command_y), m_command_velocity(command_velocity) {}
+    bool update(double time, double dt, VehicleState state)
+    {
+        m_velocity_command = m_command_velocity;
+        double delta_x = m_command_x - state.x;
+        double delta_y = m_command_y - state.y;
+        double range = sqrt(delta_x * delta_x + delta_y * delta_y);
+        double angle_command = atan2(delta_y, delta_x);
+        double psi = wrap_angle(state.psi - (std::signbit(state.v) ? M_PI : 0.0));
+        double angle_error = wrap_angle(angle_command - psi);
+        m_steering_command = angle_error * (std::signbit(state.v) ? -1.0 : 1.0);
+        return (range < 5.0);
+    }
+
+private:
+    double m_command_x, m_command_y, m_command_velocity;
+};
+
+class BicycleMotion
+{
+public:
+    BicycleMotion() : m_initial_state(VehicleState(0, 0, 0, 0)), m_wheel_base(4.0), m_max_velocity(28.0), m_max_acceleration(2.0), m_max_steering(0.8) { reset(); }
+    BicycleMotion(double x0, double y0, double psi0, double V0) : m_initial_state(VehicleState(x0, y0, psi0, V0)), m_wheel_base(4.0), m_max_velocity(28.0), m_max_acceleration(2.0), m_max_steering(0.8) { reset(); }
+
+    void reset()
+    {
+        m_current_state = m_initial_state;
+        m_steering_command = m_initial_state.steering;
+        m_velocity_command = m_initial_state.v;
+    }
+    void reset(VehicleState state)
+    {
+        m_initial_state = state;
+        reset();
+    }
+
+    void update(double dt)
+    {
+        double cos_psi = cos(m_current_state.psi);
+        double sin_psi = sin(m_current_state.psi);
+        double x = m_current_state.x + m_current_state.v * cos_psi * dt;
+        double y = m_current_state.y + m_current_state.v * sin_psi * dt;
+
+        double accel = m_velocity_command - m_current_state.v;
+        if (accel > m_max_acceleration)
+        {
+            accel = m_max_acceleration;
+        }
+        if (accel < -m_max_acceleration)
+        {
+            accel = -m_max_acceleration;
+        }
+
+        double steer = m_steering_command;
+        if (steer > m_max_steering)
+        {
+            steer = m_max_steering;
+        }
+        if (steer < -m_max_steering)
+        {
+            steer = -m_max_steering;
+        }
+
+        double vel = m_current_state.v + accel * dt;
+        if (vel > m_max_velocity)
+        {
+            vel = m_max_velocity;
+        }
+        if (vel < -m_max_velocity)
+        {
+            vel = -m_max_velocity;
+        }
+
+        double psi_dot = m_current_state.v * steer / m_wheel_base;
+        double psi = wrap_angle(m_current_state.psi + psi_dot * dt);
+        m_current_state = VehicleState(x, y, psi, vel, psi_dot, steer);
+    }
+
+    void set_steering_cmd(double steer) { m_steering_command = steer; }
+    void set_velocity_cmd(double accel) { m_velocity_command = accel; }
+    VehicleState get_vehicle_state() const { return m_current_state; }
+
+private:
+    VehicleState m_current_state;
+    VehicleState m_initial_state;
+
+    double m_steering_command;
+    double m_velocity_command;
+
+    double m_wheel_base;
+
+    double m_max_velocity;
+    double m_max_acceleration;
+    double m_max_steering;
+};
+
+class Car
+{
+public:
+    Car() : m_vehicle_model(), m_current_command(nullptr)
+    {
+        m_car_lines_body = {{2, -1}, {2, 1}, {-2, 1}, {-2, -1}, {2, -1}};
+        m_marker_lines = {{{0.5, 0.5}, {-0.5, -0.5}}, {{0.5, -0.5}, {-0.5, 0.5}}, {{0, 0}, {3.5, 0}}};
+        m_wheel_lines = {{-0.6, 0.3}, {0.6, 0.3}, {0.6, -0.3}, {-0.6, -0.3}, {-0.6, 0.3}};
+        m_wheel_fl_offset = Vector2(2, -1.6);
+        m_wheel_fr_offset = Vector2(2, 1.6);
+        m_wheel_rl_offset = Vector2(-2, -1.6);
+        m_wheel_rr_offset = Vector2(-2, 1.6);
+    }
+
+    void reset(double x0, double y0, double psi0, double V0)
+    {
+        m_vehicle_model.reset(VehicleState(x0, y0, psi0, V0));
+        while (!m_vehicle_commands.empty())
+        {
+            m_vehicle_commands.pop();
+        }
+        m_current_command = nullptr;
+    }
+
+    void add_vehicle_command(MotionCommandBase *cmd)
+    {
+        if (cmd != nullptr)
+        {
+            m_vehicle_commands.push(cmd);
+        }
+    }
+
+    VehicleState get_vehicle_state() const { return m_vehicle_model.get_vehicle_state(); }
+
+    bool update(double time, double dt)
+    {
+        if (m_current_command == nullptr && !m_vehicle_commands.empty())
+        {
+            m_current_command = m_vehicle_commands.front();
+            m_vehicle_commands.pop();
+            m_current_command->start_command(time, m_vehicle_model.get_vehicle_state());
+        }
+
+        if (m_current_command != nullptr)
+        {
+            bool cmd_complete = m_current_command->update(time, dt, m_vehicle_model.get_vehicle_state());
+            m_vehicle_model.set_steering_cmd(m_current_command->get_steering_command());
+            m_vehicle_model.set_velocity_cmd(m_current_command->get_velocity_command());
+            if (cmd_complete)
+            {
+                m_current_command = nullptr;
+            }
+        }
+        else
+        {
+            m_vehicle_model.set_steering_cmd(0.0);
+            m_vehicle_model.set_velocity_cmd(0.0);
+        }
+        m_vehicle_model.update(dt);
+        return true;
+    }
+
+    void render(Display &disp)
+    {
+        double steeringPsi = m_vehicle_model.get_vehicle_state().steering;
+        double carPsiOffset = m_vehicle_model.get_vehicle_state().psi;
+        Vector2 carPosOffset = Vector2(m_vehicle_model.get_vehicle_state().x, m_vehicle_model.get_vehicle_state().y);
+
+        disp.set_draw_color(0, 255, 0);
+        disp.draw_lines(transform_points(m_car_lines_body, carPosOffset, carPsiOffset));
+        disp.draw_lines(transform_points(m_marker_lines, carPosOffset, carPsiOffset));
+
+        disp.set_draw_color(0, 201, 0);
+        disp.draw_lines(transform_points(transform_points(m_wheel_lines, m_wheel_fl_offset, steeringPsi), carPosOffset, carPsiOffset));
+        disp.draw_lines(transform_points(transform_points(m_wheel_lines, m_wheel_fr_offset, steeringPsi), carPosOffset, carPsiOffset));
+        disp.draw_lines(transform_points(offset_points(m_wheel_lines, m_wheel_rl_offset), carPosOffset, carPsiOffset));
+        disp.draw_lines(transform_points(offset_points(m_wheel_lines, m_wheel_rr_offset), carPosOffset, carPsiOffset));
+    }
+
+private:
+    BicycleMotion m_vehicle_model;
+    MotionCommandBase *m_current_command;
+    std::queue<MotionCommandBase *> m_vehicle_commands;
+
+    std::vector<Vector2> m_car_lines_body;
+    std::vector<Vector2> m_wheel_lines;
+    std::vector<std::vector<Vector2>> m_marker_lines;
+    Vector2 m_wheel_fl_offset, m_wheel_fr_offset, m_wheel_rl_offset, m_wheel_rr_offset;
+};
